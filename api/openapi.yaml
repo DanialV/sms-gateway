@@ -1,0 +1,574 @@
+openapi: 3.1.0
+info:
+  title: SMS Gateway API
+  version: 1.0.0
+  summary: Send single-page SMS against a prepaid balance, with a guaranteed express lane for OTPs.
+  description: |
+    Every customer has a prepaid wallet. Sending a message places a **hold** of the
+    lane's price on the wallet. The hold becomes a charge when the operator accepts
+    the message (`SENT`). It is released if the message `FAILED` or `EXPIRED`. A customer
+    can spend the whole balance but is never charged past zero.
+
+    **Lanes.** `express: true` sends through the express lane: its own queue,
+    workers and reserved operator throughput, with a maximum TTL of 2 minutes. Use it
+    for OTPs. Everything else goes through the normal lane, with a maximum TTL of 24 hours.
+
+    **Fairness.** Customers, not messages, take turns. A customer with a large
+    campaign queued does not delay other customers' messages.
+
+    **Retries.** Every send carries a client-generated `client_id` (a UUID). The
+    first request with a given `client_id` wins. Repeating the request returns the
+    original message and places no new hold, even if the body differs or the
+    balance has since run out. That makes `POST /messages` safe to retry after a
+    timeout. A message can also be looked up by its `client_id`.
+
+    **Authentication** is out of scope for this exercise. The customer id in the
+    path stands in for it.
+
+    **Errors** always have the same shape: `{"error": "...", "field": "..."}`.
+    `field` is present only on validation errors.
+servers:
+  - url: http://localhost:8080
+    description: Local docker compose stack
+tags:
+  - name: Customers
+  - name: Wallet
+  - name: Messages
+  - name: Health
+
+paths:
+  /v1/customers:
+    post:
+      tags: [Customers]
+      operationId: createCustomer
+      summary: Create a customer
+      description: The server assigns the id and creates an empty wallet in the same transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCustomerRequest'
+            example:
+              name: Acme Shop
+      responses:
+        '201':
+          description: Customer created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/customers/{customerId}:
+    parameters:
+      - $ref: '#/components/parameters/CustomerId'
+    get:
+      tags: [Customers]
+      operationId: getCustomer
+      summary: Get a customer
+      responses:
+        '200':
+          description: The customer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/customers/{customerId}/topups:
+    parameters:
+      - $ref: '#/components/parameters/CustomerId'
+    post:
+      tags: [Wallet]
+      operationId: topUp
+      summary: Add credit to the wallet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TopUpRequest'
+            example:
+              amount: 100
+      responses:
+        '200':
+          description: The wallet after the top-up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/customers/{customerId}/balance:
+    parameters:
+      - $ref: '#/components/parameters/CustomerId'
+    get:
+      tags: [Wallet]
+      operationId: getBalance
+      summary: Get the wallet balance
+      responses:
+        '200':
+          description: The wallet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/customers/{customerId}/messages:
+    parameters:
+      - $ref: '#/components/parameters/CustomerId'
+    post:
+      tags: [Messages]
+      operationId: sendMessage
+      summary: Send an SMS
+      description: |
+        Accepts the message, holds its price on the wallet and queues it for delivery.
+        The response comes back before delivery: poll the message for its status.
+
+        Sending again with the same `client_id` returns the original message with
+        `202` and holds nothing, whatever the rest of the body says.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendRequest'
+            examples:
+              otp:
+                summary: OTP through the express lane
+                value:
+                  client_id: 3f6c1a52-9e1b-4c7d-8a2f-0d4b6e9a1c37
+                  phone: '+989121234567'
+                  text: Your code is 4821
+                  express: true
+              persian:
+                summary: Persian text through the normal lane, valid for one hour
+                value:
+                  client_id: 9a1d7e40-2c5b-4f8e-b3a6-71e0c4d2f915
+                  phone: '09121234567'
+                  text: سفارش شما ارسال شد
+                  ttl_seconds: 3600
+      responses:
+        '202':
+          description: Accepted for delivery, or the original message if this `client_id` was seen before.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+              example:
+                id: dTXEDxnCk3
+                customer_id: 1
+                client_id: 3f6c1a52-9e1b-4c7d-8a2f-0d4b6e9a1c37
+                phone: '+989121234567'
+                text: Your code is 4821
+                express: true
+                status: PENDING
+                price: 1
+                attempts: 0
+                created_at: '2026-10-30T01:34:01.657Z'
+                expires_at: '2026-10-30T01:36:01.657Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientBalance'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [Messages]
+      operationId: listMessages
+      summary: Report of sent messages
+      description: |
+        Messages newest first, filtered and paged with a cursor. Pass `next_cursor`
+        from the previous page as `cursor` to get the next one; it is absent once
+        a page comes back short. An unknown customer gets an empty list.
+      parameters:
+        - name: status
+          in: query
+          description: Only messages in this status. Case-insensitive.
+          schema:
+            $ref: '#/components/schemas/MessageStatus'
+        - name: from
+          in: query
+          description: Only messages created at or after this time (inclusive).
+          schema:
+            type: string
+            format: date-time
+          example: '2026-10-01T00:00:00Z'
+        - name: to
+          in: query
+          description: Only messages created before this time (exclusive).
+          schema:
+            type: string
+            format: date-time
+          example: '2026-11-01T00:00:00Z'
+        - name: cursor
+          in: query
+          description: The `next_cursor` of the previous page.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Page size. Zero or omitted means 50; values above 200 are capped at 200.
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+      responses:
+        '200':
+          description: One page of messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/customers/{customerId}/messages/{messageId}:
+    parameters:
+      - $ref: '#/components/parameters/CustomerId'
+      - name: messageId
+        in: path
+        required: true
+        description: The message `id` returned when it was sent.
+        schema:
+          type: string
+        example: dTXEDxnCk3
+    get:
+      tags: [Messages]
+      operationId: getMessage
+      summary: Get a message by id
+      responses:
+        '200':
+          description: The message with its current status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/customers/{customerId}/messages/by-client-id/{clientId}:
+    parameters:
+      - $ref: '#/components/parameters/CustomerId'
+      - name: clientId
+        in: path
+        required: true
+        description: The `client_id` the message was sent with.
+        schema:
+          type: string
+          format: uuid
+        example: 3f6c1a52-9e1b-4c7d-8a2f-0d4b6e9a1c37
+    get:
+      tags: [Messages]
+      operationId: getMessageByClientId
+      summary: Get a message by client id
+      description: Useful after a send timed out and the server's message `id` never arrived.
+      responses:
+        '200':
+          description: The message with its current status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /healthz:
+    get:
+      tags: [Health]
+      operationId: health
+      summary: Liveness check
+      responses:
+        '204':
+          description: The receiver is up.
+
+components:
+  parameters:
+    CustomerId:
+      name: customerId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 4294967295
+      example: 1
+
+  schemas:
+    CreateCustomerRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Must not be blank.
+
+    Customer:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      example:
+        id: 1
+        name: Acme Shop
+        created_at: '2026-10-30T01:34:01.632Z'
+
+    TopUpRequest:
+      type: object
+      additionalProperties: false
+      required: [amount]
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+
+    Wallet:
+      type: object
+      required: [customer_id, balance, blocked, available]
+      properties:
+        customer_id:
+          type: integer
+          format: int64
+        balance:
+          type: integer
+          format: int64
+          description: Credit in the wallet, including held amounts.
+        blocked:
+          type: integer
+          format: int64
+          description: Held for messages that are accepted but not yet settled.
+        available:
+          type: integer
+          format: int64
+          description: '`balance - blocked`: what new messages can spend.'
+      example:
+        customer_id: 1
+        balance: 100
+        blocked: 3
+        available: 97
+
+    SendRequest:
+      type: object
+      additionalProperties: false
+      required: [client_id, phone, text]
+      properties:
+        client_id:
+          type: string
+          format: uuid
+          description: Generated by the client, one per message. Must not be the nil UUID. Reuse it only to retry the same message.
+        phone:
+          type: string
+          pattern: '^\+?[0-9]{8,15}$'
+          description: 8 to 15 digits with an optional leading `+`.
+        text:
+          type: string
+          minLength: 1
+          maxLength: 160
+          description: |
+            One SMS page: up to 160 characters if every character is ASCII, otherwise
+            up to 70 (e.g. Persian). Must not be blank. The price is the same either way.
+        express:
+          type: boolean
+          default: false
+          description: Send through the express lane (OTPs).
+        ttl_seconds:
+          type: integer
+          minimum: 0
+          default: 0
+          description: |
+            How long the message may wait for delivery before it expires and its hold
+            is released. Zero or omitted means the lane's maximum: 86400 (normal) or
+            120 (express). Larger values are rejected.
+
+    MessageStatus:
+      type: string
+      enum: [PENDING, SENDING, SENT, FAILED, EXPIRED]
+      description: |
+        - `PENDING`: accepted, waiting for delivery; the price is held.
+        - `SENDING`: a worker is handing it to the operator.
+        - `SENT`: the operator accepted it; the price is charged.
+        - `FAILED`: the operator rejected it permanently (e.g. an invalid destination); the hold is released.
+        - `EXPIRED`: the TTL passed before the operator accepted it; the hold is released.
+          Temporary operator errors are retried with backoff until then.
+
+    Message:
+      type: object
+      required: [id, customer_id, client_id, phone, text, express, status, price, attempts, created_at, expires_at]
+      properties:
+        id:
+          type: string
+          description: Opaque message id. It does not reveal ordering or volume.
+        customer_id:
+          type: integer
+          format: int64
+        client_id:
+          type: string
+          format: uuid
+        phone:
+          type: string
+        text:
+          type: string
+        express:
+          type: boolean
+        status:
+          $ref: '#/components/schemas/MessageStatus'
+        price:
+          type: integer
+          format: int64
+          description: The lane's price at the time the message was accepted.
+        attempts:
+          type: integer
+          description: Delivery attempts so far.
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        sent_at:
+          type: string
+          format: date-time
+          description: Present once the status is `SENT`.
+        error:
+          type: string
+          description: The last delivery error, if any.
+      example:
+        id: dTXEDxnCk3
+        customer_id: 1
+        client_id: 3f6c1a52-9e1b-4c7d-8a2f-0d4b6e9a1c37
+        phone: '+989121234567'
+        text: Your code is 4821
+        express: true
+        status: SENT
+        price: 1
+        attempts: 1
+        created_at: '2026-10-30T01:34:01.657Z'
+        expires_at: '2026-10-30T01:36:01.657Z'
+        sent_at: '2026-10-30T01:34:01.828Z'
+
+    MessageList:
+      type: object
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        next_cursor:
+          type: string
+          description: Pass as `cursor` to get the next page. Absent on a short page.
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        field:
+          type: string
+          description: The invalid field, on validation errors only.
+
+  responses:
+    BadRequest:
+      description: Invalid input. `field` names the offending field, or `body` if the JSON is malformed or has unknown fields.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            phone:
+              value:
+                error: must be 8 to 15 digits with an optional leading +
+                field: phone
+            clientId:
+              value:
+                error: is required
+                field: client_id
+            text:
+              value:
+                error: must fit in one SMS page of 70 characters
+                field: text
+    InsufficientBalance:
+      description: The available balance does not cover the message's price. Nothing was stored or held.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: insufficient balance
+    NotFound:
+      description: Unknown customer or message.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: not found
+    PayloadTooLarge:
+      description: The request body is larger than 16 KiB.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Request Entity Too Large
+    InternalError:
+      description: Unexpected server error. Safe to retry a send with the same `client_id`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: internal error
